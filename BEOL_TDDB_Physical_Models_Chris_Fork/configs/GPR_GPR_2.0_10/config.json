@@ -1,0 +1,1 @@
+{"pipeline_type": "GPR", "M_structures": 3600000, "F_target": 1.2087541473056965e-06, "N_samples_per_dim": 16, "unit_model_kwargs": {"model_type": "GPR", "actual_vl_max": 40.0, "actual_ll_max": 20.0}, "threshold": 1758.3429243407004}
