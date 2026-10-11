@@ -1,0 +1,1 @@
+{"pipeline_type": "DPM", "M_structures": 300000, "F_target": 0.0029154431891537554, "N_samples_per_dim": 10, "unit_model_kwargs": {"model_type": "InverseE"}, "threshold": 4.728848900540298e+151}

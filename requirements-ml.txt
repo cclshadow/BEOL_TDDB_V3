@@ -1,0 +1,4 @@
+# Optional dependencies for the supervised spatial ML backends.
+# The GP+boost backend falls back to scikit-learn if lightgbm is unavailable.
+lightgbm>=4.0
+torch>=2.2
