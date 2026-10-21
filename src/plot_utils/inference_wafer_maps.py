@@ -32,8 +32,10 @@ def plot_five_trends(
     # 1. 工艺尺寸 vl 和 ll 的连续空间 GPR 插值
     # --------------------------------------------------------
     xx, yy, zz_vl, _ = perform_gpr(x_die, y_die, vl_val)
-    
-    _, _, zz_ll, _ = perform_gpr(x_die, y_die, ll_val)
+
+    # ll_val is None when MS.csv was not provided (via-only pipelines)
+    # 未提供 MS.csv 时 ll_val 为 None（仅 via 流水线）
+    zz_ll = perform_gpr(x_die, y_die, ll_val)[2] if ll_val is not None else None
 
     # --------------------------------------------------------
     # 2. 晶圆掩膜 (仅用于 GPR 连续插值图)
@@ -43,7 +45,8 @@ def plot_five_trends(
 
     wafer_mask = create_wafer_mask(xx + 0.5, yy + 0.5, wafer_radius)
     zz_vl = np.where(wafer_mask, zz_vl, np.nan)
-    zz_ll = np.where(wafer_mask, zz_ll, np.nan)
+    if zz_ll is not None:
+        zz_ll = np.where(wafer_mask, zz_ll, np.nan)
 
     # --------------------------------------------------------
     # 3. 画布布局初始化 (🌟 更改为 2 行 3 列)
@@ -82,19 +85,32 @@ def plot_five_trends(
     draw_gpr_subplot(axes[0, 0], zz_vl, 'Space (vl) Spatial Trend\n(GPR Continuous)', 'Space Measurement (nm)')
 
     # 图2：MS (ll)
-    draw_gpr_subplot(axes[0, 1], zz_ll, 'MS (ll) Spatial Trend\n(GPR Continuous)', 'MS Measurement (nm)')
+    if zz_ll is not None:
+        draw_gpr_subplot(axes[0, 1], zz_ll, 'MS (ll) Spatial Trend\n(GPR Continuous)', 'MS Measurement (nm)')
+    else:
+        axes[0, 1].axis('off')
+        axes[0, 1].set_title('MS (ll) not provided', fontsize=14)
 
     # 图3：预测寿命 t (矢量矩形块连续图)
     ax_t = axes[0, 2]
-    norm = LogNorm(vmin=np.nanmin(t_scores), vmax=np.nanmax(t_scores)) if use_log_scale_for_t else plt.Normalize(vmin=np.nanmin(t_scores), vmax=np.nanmax(t_scores))
+    # Log scale is set from positive lifetimes only; shorted dies (TTF = 0) are drawn
+    # in the colormap's lowest colour. Falls back to linear if no die has TTF > 0.
+    # 对数色标仅由正寿命决定；短路 Die（TTF = 0）以色图最低端颜色绘制。若无正寿命则退回线性色标。
+    t_positive = t_scores[np.isfinite(t_scores) & (t_scores > 0)]
+    log_t = use_log_scale_for_t and t_positive.size > 0
+    if log_t:
+        t_min, t_max = t_positive.min(), t_positive.max()
+        norm = LogNorm(vmin=t_min, vmax=t_max if t_max > t_min else t_min * 10)
+    else:
+        norm = plt.Normalize(vmin=np.nanmin(t_scores), vmax=np.nanmax(t_scores))
     mapper = cm.ScalarMappable(norm=norm, cmap=cmap)
-    
+
     for x, y, score in zip(x_die, y_die, t_scores):
         if np.isfinite(score):
             rect = Rectangle(
                 xy=(x - 0.5, y - 0.5),
                 width=1.0, height=1.0,
-                facecolor=mapper.to_rgba(score),
+                facecolor=mapper.cmap(0.0) if (log_t and score <= 0) else mapper.to_rgba(score),
                 edgecolor='none', zorder=2
             )
             ax_t.add_patch(rect)

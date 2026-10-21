@@ -30,7 +30,8 @@ class TwoStageWaferOptimizer:
                  train_deltas: bool = False,                # 🌟 是否一并训练物理 delta
                  delta_l2: float = 0.0,                     # 🌟 delta 向 0 收缩的 L2 正则权重
                  anchor_ttf: float = None,                  # 🌟 绝对尺度锚点 (秒)；None 关闭
-                 anchor_weight: float = 0.0):               # 🌟 锚点惩罚权重
+                 anchor_weight: float = 0.0,                # 🌟 锚点惩罚权重
+                 fixed_params: Tuple[str, ...] = ()):       # 🌟 不参与搜索、直接取自 base_config 的参数
         """
         Args:
             train_jobs / val_jobs: Task paths dictionaries for train/validation. / 训练/验证任务字典列表。
@@ -44,6 +45,10 @@ class TwoStageWaferOptimizer:
             batch_size: Number of wafers per batch during processing. / 每一批处理的晶圆数量。
             num_workers: CPU workers assigned for interpolation. / 分配给插值计算的 CPU 核心数。
             beta: F-beta score weight (e.g., beta=2.0 privileges Recall). / F-beta 评分的权重因子。
+            fixed_params: Names among M_structures / F_target / N_samples_per_dim that are
+                          held at their base_config value instead of being searched.
+                          在 M_structures / F_target / N_samples_per_dim 中指定不搜索、
+                          固定为 base_config 取值的参数名。
         """
         self.train_jobs = train_jobs
         self.val_jobs = val_jobs
@@ -105,7 +110,21 @@ class TwoStageWaferOptimizer:
         if search_spaces:
             default_spaces.update(search_spaces)
         self.search_spaces = default_spaces
-        
+
+        # Parameters held fixed at their base_config value / 固定为 base_config 取值的参数
+        self.fixed_params = tuple(fixed_params)
+        for name in self.fixed_params:
+            if name not in self.search_spaces:
+                raise ValueError(f"Unknown fixed parameter '{name}'. "
+                                 f"Valid: {list(self.search_spaces.keys())}")
+            if base_config.get(name) is None:
+                raise ValueError(f"Fixed parameter '{name}' must be set in base_config.")
+        self.searched_params = [n for n in self.search_spaces if n not in self.fixed_params]
+        if not self.searched_params and not self.train_deltas:
+            raise ValueError("Nothing to optimise: every parameter is fixed and deltas are not trained.")
+        if self.fixed_params:
+            print("[Fixed] " +", ".join(f"{n}={base_config[n]}" for n in self.fixed_params))
+
         # Pre-concatenate full ground-truth vectors / 预先拼装全量真实标签向量
         self.y_train_true_flat = np.concatenate(train_labels)
         self.y_val_true_flat = np.concatenate(val_labels)
@@ -139,16 +158,18 @@ class TwoStageWaferOptimizer:
         
         # 1. Clone the base configuration and overlay the proposed hyper-parameters
         # 深度复制原始 config，并用当前轮次外层推荐的 3D 参数进行覆盖替换
+        #    Fixed parameters keep their base_config value / 固定参数保留 base_config 中的取值
         current_config = copy.deepcopy(self.base_config)
         m_space = self.search_spaces["M_structures"]
         f_space = self.search_spaces["F_target"]
         n_space = self.search_spaces["N_samples_per_dim"]
-        
-        current_config.update({
-            "M_structures": trial.suggest_int("M_structures", m_space[0], m_space[1], step=m_space[2]),
-            "F_target": trial.suggest_float("F_target", f_space[0], f_space[1], log=True),
-            "N_samples_per_dim": trial.suggest_int("N_samples_per_dim", n_space[0], n_space[1], step=n_space[2])
-        })
+
+        if "M_structures" in self.searched_params:
+            current_config["M_structures"] = trial.suggest_int("M_structures", m_space[0], m_space[1], step=m_space[2])
+        if "F_target" in self.searched_params:
+            current_config["F_target"] = trial.suggest_float("F_target", f_space[0], f_space[1], log=True)
+        if "N_samples_per_dim" in self.searched_params:
+            current_config["N_samples_per_dim"] = trial.suggest_int("N_samples_per_dim", n_space[0], n_space[1], step=n_space[2])
 
         # Add the physics deltas as extra search dimensions (if enabled)
         # 若开启，则把物理 delta 作为额外的搜索维度加入本轮试验
@@ -237,13 +258,10 @@ class TwoStageWaferOptimizer:
         # ======================================================================
         # FILE 1: Optimized Config / 文件 1：优化后的纯净配置（直接用于生产投产）
         # ======================================================================
+        #    Fixed parameters are already in base_config / 固定参数已包含在 base_config 中
         optimized_config = copy.deepcopy(self.base_config)
-        optimized_config.update({
-            "M_structures": study.best_params["M_structures"],
-            "F_target": study.best_params["F_target"],
-            "N_samples_per_dim": study.best_params["N_samples_per_dim"],
-            "threshold": opt_solution  # Injecting the analytically resolved decision boundary
-        })
+        optimized_config.update({name: study.best_params[name] for name in self.searched_params})
+        optimized_config["threshold"] = opt_solution  # Injecting the analytically resolved decision boundary
 
         # Persist the winning physics deltas so config.json round-trips into inference
         # 将胜出的物理 delta 写入配置，使 config.json 能无缝还原到推理阶段
@@ -269,7 +287,8 @@ class TwoStageWaferOptimizer:
                 "best_deltas": best_deltas,
                 "delta_l2": self.delta_l2,
                 "anchor_ttf_seconds": self.anchor_ttf,
-                "anchor_weight": self.anchor_weight
+                "anchor_weight": self.anchor_weight,
+                "fixed_params": {name: self.base_config[name] for name in self.fixed_params}
             },
             "history_telemetry": {
                 "iteration": list(self.history["iteration"]),

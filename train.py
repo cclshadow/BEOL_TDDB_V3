@@ -21,6 +21,7 @@ from src.param_optimizer import TwoStageWaferOptimizer
 from src.csv_utils import (
 	load_matrix_csv,
 	matrix_to_sparse_points,
+	valid_die_mask,
 	)
 
 def _build_jobs_and_labels(wafer_paths: List[Path]):
@@ -32,13 +33,14 @@ def _build_jobs_and_labels(wafer_paths: List[Path]):
 			{
 				"vl_path": wafer_path / "Space.csv",
 				"ll_path": wafer_path / "MS.csv",
+				"class_path": wafer_path / "ExistenceClass.csv",
 				"mode": "ttf_only",
 				"output_ttf_path": None,
 				"output_binary_path": None,
 			}
 		)
 		class_val_matrix = load_matrix_csv(wafer_path / "ExistenceClass.csv").astype(np.int32)
-		_, _, class_val, _ = matrix_to_sparse_points(class_val_matrix)
+		_, _, class_val, _ = matrix_to_sparse_points(class_val_matrix, valid_die_mask(class_val_matrix))
 		labels.append(np.where(class_val == 3, 1, 0))
 	return job_list, labels
 
@@ -94,14 +96,18 @@ def build_train_job_and_label(dataset_path):
 
 def main():
 	parser = argparse.ArgumentParser(description='Train a model')
-	parser.add_argument('--pipeline-type', type=str, choices=['GPR', 'DPM', 'Linear'], help='Prediction Pipeline Type')
+	parser.add_argument('--pipeline-type', type=str, choices=['GPR', 'DPM', 'Linear', 'DPM_revised_ViaOnly'], help='Prediction Pipeline Type')
 	parser.add_argument('--model-type', type=str, default=None, choices=['PowerLaw', 'SqrtE', 'InverseE', 'PowerLawScaled', 'SqrtEScaled', 'InverseEScaled'], help='Only for DPM pipelines')
 	parser.add_argument('--spacing-scale', type=float, default=1.0, help='Spacing divisor k for scaled DPM models (e.g. 3.0 maps 9-22nm into 3-7nm)')
 	# --- Physics-delta training (DPM models only; GPR/Linear transparently ignore these) ---
 	parser.add_argument('--train-deltas', action='store_true', help='Also fit the physics deltas (empirical-fit corrections) during optimisation.')
-	parser.add_argument('--delta-l2', type=float, default=0.0, help='L2 shrink of deltas toward the physical baseline (delta=0). 0 = off.')
+	parser.add_argument('--delta-l2', type=float, default=None, help='L2 shrink of deltas toward the physical baseline (delta=0). 0 = off. Default: 0.01 for DPM_revised_ViaOnly with --train-deltas, else 0.')
 	parser.add_argument('--anchor-years', type=float, default=None, help='Anchor the learned decision boundary to this lifetime (years) as an absolute-scale prior. None = off.')
 	parser.add_argument('--anchor-weight', type=float, default=0.0, help='Weight of the anchor penalty (log-space). 0 = off.')
+	# --- DPM_revised_ViaOnly only: user-specified physics inputs (not searched) ---
+	parser.add_argument('--M-structures', type=int, default=None, help='DPM_revised_ViaOnly only: total via-line structures per die (fixed, not searched)')
+	parser.add_argument('--F-target', type=float, default=None, help='DPM_revised_ViaOnly only: target cumulative failure fraction (fixed, not searched)')
+	parser.add_argument('--v-op', type=float, default=None, help='DPM_revised_ViaOnly only: operating voltage in V (default 0.7)')
 	parser.add_argument('--manifest', type=str, default=None, help='Path to split_manifest.json from create_split.py (overrides --training-path / --validation-path)')
 	parser.add_argument('--training-path', type=str, help='Path for training set (ignored when --manifest is set)')
 	parser.add_argument('--validation-path', type=str, help='Path for validation set (ignored when --manifest is set)')
@@ -113,6 +119,20 @@ def main():
 	args = parser.parse_args()
 	if args.pipeline_type == 'GPR': args.model_type = 'GPR'
 	if args.pipeline_type == 'Linear': args.model_type = 'Linear'
+
+	via_only = args.pipeline_type == 'DPM_revised_ViaOnly'
+	if via_only:
+		if args.model_type not in ('PowerLaw', 'SqrtE', 'InverseE'):
+			parser.error("DPM_revised_ViaOnly requires --model-type PowerLaw, SqrtE or InverseE")
+		if args.spacing_scale != 1.0:
+			parser.error("--spacing-scale is not supported by DPM_revised_ViaOnly")
+		if args.M_structures is None or args.F_target is None:
+			parser.error("DPM_revised_ViaOnly requires --M-structures and --F-target")
+		if args.v_op is None: args.v_op = 0.7
+	elif any(v is not None for v in (args.M_structures, args.F_target, args.v_op)):
+		parser.error("--M-structures, --F-target and --v-op are only used by DPM_revised_ViaOnly")
+	if args.delta_l2 is None:
+		args.delta_l2 = 0.01 if (via_only and args.train_deltas) else 0.0
 	print(args)
 
 	# build job list and label
@@ -148,6 +168,13 @@ def main():
 			config["unit_model_kwargs"]["actual_ll_max"] = 20.0
 		if args.spacing_scale != 1.0:
 			config["unit_model_kwargs"]["spacing_scale"] = args.spacing_scale
+	fixed_params = ()
+	if via_only:
+		# User-specified M and F are held fixed; only N (and any deltas) are searched
+		config["M_structures"] = args.M_structures
+		config["F_target"] = args.F_target
+		config["unit_model_kwargs"]["v_op"] = args.v_op
+		fixed_params = ("M_structures", "F_target")
 
 	# Convert the anchor lifetime from years to seconds (matches physics TTF units)
 	anchor_ttf = args.anchor_years * 365.25 * 24 * 3600 if args.anchor_years else None
@@ -168,7 +195,8 @@ def main():
 					train_deltas=args.train_deltas,
 					delta_l2=args.delta_l2,
 					anchor_ttf=anchor_ttf,
-					anchor_weight=args.anchor_weight
+					anchor_weight=args.anchor_weight,
+					fixed_params=fixed_params
 					)
 
 	optimized_config, optimization_metadata = optimizer.run_optimization(

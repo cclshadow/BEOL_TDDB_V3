@@ -1,4 +1,5 @@
 from multiprocessing import Pool, cpu_count as get_cpu_count
+from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 from tqdm import tqdm
@@ -7,7 +8,8 @@ from .csv_utils import (
     load_matrix_csv,
     matrix_to_sparse_points,
     sparse_points_to_matrix,
-    save_matrix_csv
+    save_matrix_csv,
+    valid_die_mask
 )
 from .prediction_pipeline import IntegratedWaferPipeline
 
@@ -52,7 +54,8 @@ def _process_and_save_by_path(path_job: Dict[str, Any]) -> Tuple[Optional[np.nda
     # Extract paths and mode (defaulting to 'both' if not specified)
     # 提取输入、输出路径及运行模式（如果未指定，默认执行全套预测）
     vl_path = path_job["vl_path"]
-    ll_path = path_job["ll_path"]
+    ll_path = path_job.get("ll_path", None)
+    class_path = path_job.get("class_path", None)
     output_ttf_path = path_job.get("output_ttf_path", None)
     output_binary_path = path_job.get("output_binary_path", None)
     mode = path_job.get("mode", "both") 
@@ -60,26 +63,43 @@ def _process_and_save_by_path(path_job: Dict[str, Any]) -> Tuple[Optional[np.nda
     try:
         # 1. Read and parse original CSV matrices / 读取并解析原始 CSV 矩阵
         vl_matrix = load_matrix_csv(vl_path)
-        ll_matrix = load_matrix_csv(ll_path)
-        
-        # 2. Convert to sparse spatial points and capture original shape 
+        # Mask dies by ExistenceClass so both channels stay aligned with the labels
+        # 使用 ExistenceClass 掩码，保证两个通道与标签逐 Die 对齐
+        mask = valid_die_mask(load_matrix_csv(class_path)) if class_path is not None else None
+
+        # 2. Convert to sparse spatial points and capture original shape
         #    空间稀疏化转换，并捕获原始矩阵形状用于后续重建
-        x, y, vl_val, orig_shape = matrix_to_sparse_points(vl_matrix)
-        _, _, ll_val, _ = matrix_to_sparse_points(ll_matrix)
-        
+        x, y, vl_val, orig_shape = matrix_to_sparse_points(vl_matrix, mask)
+
+        # MS (line-line) is optional: via-only pipelines run without it
+        # MS (line-line) 为可选输入：仅 via 的流水线可在缺少它时运行
+        ll_val = None
+        if ll_path is not None and Path(ll_path).exists():
+            _, _, ll_val, _ = matrix_to_sparse_points(load_matrix_csv(ll_path), mask)
+
+        # Dies with zero spacing are shorted: hard failures (TTF = 0, label 0 = bad).
+        # The physics model is undefined at Space = 0, so it only sees dies with Space > 0.
+        # 间距为 0 的 Die 视为短路：直接判定失效（TTF = 0，标签 0 = 坏）。
+        # 物理模型在 Space = 0 处无定义，因此只对 Space > 0 的 Die 进行预测。
+        alive = vl_val > 0
+        xa, ya, vla = x[alive], y[alive], vl_val[alive]
+        lla = ll_val[alive] if ll_val is not None else None
+
         # 3. Execute pipeline prediction based on the selected mode
         #    根据指定的 mode 执行对应的流水线预测
+        ttf_lifetimes = np.zeros(len(vl_val), dtype=float)
         if mode == "ttf_only":
             # Run Layer 1 & 2 only (No threshold constraints) / 仅调用第一、二层（无需阈值限制）
-            ttf_lifetimes = _worker_pipeline.predict_ttf(
-                x_die=x, y_die=y, vl_data=vl_val, ll_data=ll_val
+            ttf_lifetimes[alive] = _worker_pipeline.predict_ttf(
+                x_die=xa, y_die=ya, vl_data=vla, ll_data=lla
             )
             binary_labels = None
-            
+
         elif mode == "both":
             # Run full pipeline: Layer 1, 2 & 3 / 双输出模式，调用全套流水线
-            ttf_lifetimes, binary_labels = _worker_pipeline.predict(
-                x_die=x, y_die=y, vl_data=vl_val, ll_data=ll_val
+            binary_labels = np.zeros(len(vl_val), dtype=int)
+            ttf_lifetimes[alive], binary_labels[alive] = _worker_pipeline.predict(
+                x_die=xa, y_die=ya, vl_data=vla, ll_data=lla
             )
         else:
             raise ValueError(f"Unknown job mode: {mode}")
@@ -90,7 +110,9 @@ def _process_and_save_by_path(path_job: Dict[str, Any]) -> Tuple[Optional[np.nda
         # Reconstruct and save TTF matrix (save_matrix_csv safely ignores None paths)
         # 重建并保存连续寿命矩阵（save_matrix_csv 函数内部已处理路径为 None 的跳过逻辑）
         dense_ttf_matrix = sparse_points_to_matrix(x, y, ttf_lifetimes, orig_shape)
-        save_matrix_csv(dense_ttf_matrix, output_ttf_path)
+        # Scientific notation: lifetimes can be far below 1e-6 or far above 1e6
+        # 使用科学计数法：寿命值可能远小于 1e-6 或远大于 1e6
+        save_matrix_csv(dense_ttf_matrix, output_ttf_path, fmt='%.9e')
 
         # Reconstruct and save Binary matrix if applicable
         # 如果存在二分类结果，则重建并保存二分类矩阵

@@ -2,9 +2,15 @@ import numpy as np
 import json
 
 from .unit_level_models.model_factory import unit_model_factory
-from .wafer_level_models.wafer_reliability_engines import GPRWaferEngine, DPMWaferEngine
+from .wafer_level_models.wafer_reliability_engines import (
+    GPRWaferEngine, DPMWaferEngine, DPMRevisedViaOnlyWaferEngine
+)
 from .wafer_level_models.linear_engine import LinearWaferEngine
 from .reliability_classifiers.binary_classifier import BinaryReliabilityClassifier
+
+# Pipelines that only use via-line spacing and can run without MS (line-line) data
+# 仅使用 via-line 间距、可在缺少 MS (line-line) 数据时运行的流水线
+VIA_ONLY_PIPELINES = {"DPM_revised_ViaOnly"}
 
 # ==============================================================================
 # Top-Level Assembly Pipeline (Refactored) / 顶层组装流水线类（重构版）
@@ -64,6 +70,13 @@ class IntegratedWaferPipeline:
                 M_structures=self.M_structures,
                 F_target=self.F_target
             )
+        elif self.pipeline_type == "DPM_revised_ViaOnly":
+            self.unit_model_via = unit_model_factory(target_component='via', **self.unit_model_kwargs)
+            self.engine = DPMRevisedViaOnlyWaferEngine(
+                unit_model_via=self.unit_model_via,
+                M_structures=self.M_structures,
+                F_target=self.F_target
+            )
         elif self.pipeline_type == "Linear":
             self.engine = LinearWaferEngine(
                 M_structures=self.M_structures,
@@ -99,6 +112,10 @@ class IntegratedWaferPipeline:
             np.ndarray: Continuous time-to-failure (TTF) arrays for each die.
                         各个 Die 的连续失效寿命（TTF）数组。
         """
+        if ll_data is None and self.pipeline_type not in VIA_ONLY_PIPELINES:
+            raise ValueError(f"Pipeline '{self.pipeline_type}' requires MS.csv (line-line spacing), "
+                             f"but none was provided.")
+
         # Execute spatial interpolation + weakest link equation solving
         # 直接执行空间插值与最薄弱环节方程求解，返回寿命数组
         ttf_lifetimes = self.engine.predict_die_lifetimes(

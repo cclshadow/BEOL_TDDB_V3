@@ -17,6 +17,7 @@ from src.multiprocessing_wrapper import batch_process_by_path
 from src.csv_utils import (
 	load_matrix_csv,
 	matrix_to_sparse_points,
+	valid_die_mask,
 	)
 from src.plot_utils.inference_wafer_maps import plot_five_trends
 
@@ -132,13 +133,14 @@ def build_test_job_and_label(io_pairs):
                 {
                     "vl_path": in_path / 'Space.csv',
                     "ll_path": in_path / 'MS.csv',
+                    "class_path": in_path / 'ExistenceClass.csv',
                     "mode": "both",
                     "output_ttf_path": out_path / 'ttf.csv',
                     "output_binary_path": out_path / 'binary_label.csv'
                 }
             )
         class_val_matrix = load_matrix_csv(in_path / 'ExistenceClass.csv').astype(np.int32)
-        _, _, class_val, _ = matrix_to_sparse_points(class_val_matrix)
+        _, _, class_val, _ = matrix_to_sparse_points(class_val_matrix, valid_die_mask(class_val_matrix))
         labels.append(np.where(class_val == 3, 1, 0))		# 1 or 2: bad chip (0); 3: good chip (1)
 
     return job_list, labels
@@ -157,11 +159,14 @@ def plot_wafer_worker(job_kwargs: dict) -> str:
     try:
         # 1. 独立加载数据 / Load data independently in the child process
         vl_matrix = load_matrix_csv(job_kwargs['vl_path'])
-        ll_matrix = load_matrix_csv(job_kwargs['ll_path'])
-        
+        mask = valid_die_mask(load_matrix_csv(job_kwargs['class_path']))
+
         # 2. 转换为稀疏点 / Convert to sparse points
-        x, y, vl_val, _ = matrix_to_sparse_points(vl_matrix)
-        _, _, ll_val, _ = matrix_to_sparse_points(ll_matrix)
+        x, y, vl_val, _ = matrix_to_sparse_points(vl_matrix, mask)
+        # MS is optional (via-only pipelines) / MS 为可选输入（仅 via 流水线）
+        ll_val = None
+        if Path(job_kwargs['ll_path']).exists():
+            _, _, ll_val, _ = matrix_to_sparse_points(load_matrix_csv(job_kwargs['ll_path']), mask)
         
         # 3. 执行重型绘图任务 / Execute the heavy plotting function
         plot_five_trends(
@@ -271,6 +276,7 @@ def main():
             'idx': idx,
             'vl_path': test_jobs[idx]['vl_path'],
             'll_path': test_jobs[idx]['ll_path'],
+            'class_path': test_jobs[idx]['class_path'],
             'ttf_res': ttf_res,
             'test_label': test_labels[idx],
             'label_res': label_res,

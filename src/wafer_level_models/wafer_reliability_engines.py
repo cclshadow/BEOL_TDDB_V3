@@ -100,6 +100,22 @@ class BaseWaferEngine(ABC):
         # 3. Reshape back to wafer matrix format / 恢复成晶圆矩阵形状
         return pred_flat.reshape(x_query_grid.shape)
 
+    @staticmethod
+    def _shorted_die_mask(vl_interpolated: np.ndarray) -> np.ndarray:
+        """
+        Dies whose interpolated spacing reaches <= 0 at any inner sample are shorted.
+        They are hard failures (TTF = 0); the unit models are undefined at Space <= 0.
+
+        任一内部采样点的插值间距 <= 0 的 Die 视为短路，直接判定失效（TTF = 0）；
+        单元模型在 Space <= 0 处无定义。
+
+        Args:
+            vl_interpolated: Shape (n_dies, N_inner). / 形状为 (n_dies, N_inner)。
+        Returns:
+            np.ndarray: Boolean mask of shape (n_dies,). / 形状为 (n_dies,) 的布尔掩码。
+        """
+        return np.any(vl_interpolated <= 0, axis=1)
+
     def _solve_lifetime_vectorized(self, beta_matrix: np.ndarray, eta_matrix: np.ndarray) -> np.ndarray:
         """
         Universal Vectorized Newton-Raphson Solver based on Weakest Link Theory.
@@ -139,15 +155,23 @@ class BaseWaferEngine(ABC):
         return t
 
     def _solve_lifetime_log_vectorized(self, beta_matrix: np.ndarray,
-                                       ln_eta_matrix: np.ndarray) -> np.ndarray:
+                                       ln_eta_matrix: np.ndarray,
+                                       element_weight: float = 1.0) -> np.ndarray:
         """Solve weakest-link lifetime directly in log space.
 
         For ``x = ln(t)``, the target equation is
 
-            log(sum(exp(beta_i * (x - ln_eta_i)))) = log(target_hazard / M).
+            log(sum(exp(beta_i * (x - ln_eta_i)))) = log(target_hazard / (M * w)).
 
         A log-sum-exp Newton iteration avoids materializing unit-level ``eta``
         values, which may legitimately exceed the float64 exponential range.
+
+        Args:
+            element_weight: Fraction ``w`` of the die's M structures that each
+                element represents. The default 1.0 counts every element as M
+                structures; 1 / N_inner spreads M across the die's sample points.
+                每个元素代表的 M 结构比例 w。默认 1.0 表示每个元素计为 M 个结构；
+                取 1 / N_inner 则表示 M 个结构均摊到 Die 内的各采样点。
         """
         beta_matrix = np.asarray(beta_matrix, dtype=float)
         ln_eta_matrix = np.asarray(ln_eta_matrix, dtype=float)
@@ -162,7 +186,7 @@ class BaseWaferEngine(ABC):
             raise ValueError("Weakest-link solve requires finite ln(eta) values.")
 
         n_elements = beta_matrix.shape[1]
-        log_target = np.log(self.target_hazard / self.M)
+        log_target = np.log(self.target_hazard / (self.M * element_weight))
 
         # This initialization assigns at most an equal share of the target
         # hazard to every element, providing a finite lower bracket.
@@ -233,20 +257,29 @@ class GPRWaferEngine(BaseWaferEngine):
         # 2. 在 X 与 Y 方向上执行真正的空间曲面回归插值
         vl_interpolated = self._interpolate_wafer_surface(x_die, y_die, vl_data, x_grid, y_grid)
         ll_interpolated = self._interpolate_wafer_surface(x_die, y_die, ll_data, x_grid, y_grid)
-        
+
+        # Shorted dies keep TTF = 0; only the rest go through the unit model
+        # 短路 Die 保持 TTF = 0，仅对其余 Die 调用单元模型
+        ttf = np.zeros(n_dies)
+        ok = ~self._shorted_die_mask(vl_interpolated)
+        n_ok = int(ok.sum())
+        if n_ok == 0:
+            return ttf
+
         # 3. Flatten into the standard 2D feature matrix required by the Unit GPR Model
         # 3. 转换成符合微观 Unit GPR 模型要求的特征输入: (n_dies * N_inner, 2)
-        X_unit = np.column_stack([vl_interpolated.flatten(), ll_interpolated.flatten()])
-        
+        X_unit = np.column_stack([vl_interpolated[ok].flatten(), ll_interpolated[ok].flatten()])
+
         # 4. Perform joint microscopic prediction / 4. 执行微观联合预测
         beta_pred, eta_pred = self.model_joint.predict_weibull_params(X_unit)
-        
+
         # Reshape to Die-level grids / 重塑回 Die 级网格
-        beta_matrix = beta_pred.reshape((n_dies, N_inner))
-        eta_matrix = eta_pred.reshape((n_dies, N_inner))
-        
+        beta_matrix = beta_pred.reshape((n_ok, N_inner))
+        eta_matrix = eta_pred.reshape((n_ok, N_inner))
+
         # 5. Solve macroscopic system-level weakest-link / 5. 宏观系统级最薄弱环节求解
-        return self._solve_lifetime_vectorized(beta_matrix, eta_matrix)
+        ttf[ok] = self._solve_lifetime_vectorized(beta_matrix, eta_matrix)
+        return ttf
 
 
 # ==============================================================================
@@ -279,20 +312,28 @@ class DPMWaferEngine(BaseWaferEngine):
         # 2. 在 X 与 Y 方向上执行真正的空间曲面回归插值
         vl_interpolated = self._interpolate_wafer_surface(x_die, y_die, vl_data, x_grid, y_grid)
         ll_interpolated = self._interpolate_wafer_surface(x_die, y_die, ll_data, x_grid, y_grid)
-        
-        X_unit = np.column_stack([vl_interpolated.flatten(), ll_interpolated.flatten()])
-        
+
+        # Shorted dies keep TTF = 0; only the rest go through the physics models
+        # 短路 Die 保持 TTF = 0，仅对其余 Die 调用物理模型
+        ttf = np.zeros(n_dies)
+        ok = ~self._shorted_die_mask(vl_interpolated)
+        n_ok = int(ok.sum())
+        if n_ok == 0:
+            return ttf
+
+        X_unit = np.column_stack([vl_interpolated[ok].flatten(), ll_interpolated[ok].flatten()])
+
         # 3. Calculate separate micro-physics models for Via and Line
         # 3. 分别计算 Via 和 Line 的独立微观物理模型
         beta_via, ln_eta_via = self.model_via.predict_weibull_log_params(X_unit)
         beta_line, ln_eta_line = self.model_line.predict_weibull_log_params(X_unit)
-        
+
         # Reshape to separate Die-level grids / 重塑回独立的 Die 级网格
-        beta_via_mat = beta_via.reshape((n_dies, N_inner))
-        ln_eta_via_mat = ln_eta_via.reshape((n_dies, N_inner))
-        
-        beta_line_mat = beta_line.reshape((n_dies, N_inner))
-        ln_eta_line_mat = ln_eta_line.reshape((n_dies, N_inner))
+        beta_via_mat = beta_via.reshape((n_ok, N_inner))
+        ln_eta_via_mat = ln_eta_via.reshape((n_ok, N_inner))
+
+        beta_line_mat = beta_line.reshape((n_ok, N_inner))
+        ln_eta_line_mat = ln_eta_line.reshape((n_ok, N_inner))
         
         # 4. CRITICAL: Weakest Link Physical Risk Integration
         #    Horizontal concatenation (axis=1) perfectly aligns with the multiplication 
@@ -301,6 +342,59 @@ class DPMWaferEngine(BaseWaferEngine):
         #    沿着 axis=1 横向拼接，完美契合联合可靠性连乘法则，且无需进行公式耦合！
         beta_matrix = np.concatenate([beta_via_mat, beta_line_mat], axis=1) # Shape: (n_dies, 2 * N_inner)
         ln_eta_matrix = np.concatenate([ln_eta_via_mat, ln_eta_line_mat], axis=1)  # Shape: (n_dies, 2 * N_inner)
-        
+
         # 5. Solve macroscopic system-level weakest-link / 5. 宏观系统级最薄弱环节求解
-        return self._solve_lifetime_log_vectorized(beta_matrix, ln_eta_matrix)
+        ttf[ok] = self._solve_lifetime_log_vectorized(beta_matrix, ln_eta_matrix)
+        return ttf
+
+
+# ==============================================================================
+# 5. Revised DPM Via-Only Wafer Engine / 修订版 DPM 仅 Via 晶圆模型
+# ==============================================================================
+class DPMRevisedViaOnlyWaferEngine(BaseWaferEngine):
+    """
+    Physics (DPM) engine that models via-line breakdown only.
+    M_structures is the total number of via-line structures per die, spread evenly
+    across the N x N inner sample points, so the die lifetime does not depend on N
+    for a uniform die. Line-line (MS) data is not used.
+
+    仅对 via-line 击穿建模的 DPM 物理晶圆流水线。
+    M_structures 为每个 Die 内 via-line 结构的总数，均摊到 N x N 个内部采样点上，
+    因此对均匀 Die 而言寿命与 N 无关。不使用 line-line (MS) 数据。
+    """
+    def __init__(self, unit_model_via: BaseTDDBModel,
+                 M_structures: float = 1e6, F_target: float = 1e-4):
+        super().__init__(M_structures, F_target)
+        self.model_via = unit_model_via
+
+    def predict_die_lifetimes(self, x_die: np.ndarray, y_die: np.ndarray,
+                              vl_data: np.ndarray, ll_data: np.ndarray = None,
+                              N_samples_per_dim: int = 10) -> np.ndarray:
+        n_dies = len(x_die)
+
+        # 1. Inner-die sample grid and via-spacing interpolation only
+        # 1. 建立 Die 内采样网格，仅插值 via 间距
+        x_grid, y_grid, N_inner = self._generate_inner_die_grid(x_die, y_die, N_samples_per_dim)
+        vl_interpolated = self._interpolate_wafer_surface(x_die, y_die, vl_data, x_grid, y_grid)
+
+        # Shorted dies keep TTF = 0; only the rest go through the physics model
+        # 短路 Die 保持 TTF = 0，仅对其余 Die 调用物理模型
+        ttf = np.zeros(n_dies)
+        ok = ~self._shorted_die_mask(vl_interpolated)
+        n_ok = int(ok.sum())
+        if n_ok == 0:
+            return ttf
+
+        # 2. Via-line Weibull parameters at every sample point
+        # 2. 计算每个采样点的 via-line Weibull 参数
+        X_unit = vl_interpolated[ok].reshape(-1, 1)
+        beta_via, ln_eta_via = self.model_via.predict_weibull_log_params(X_unit)
+        beta_matrix = beta_via.reshape((n_ok, N_inner))
+        ln_eta_matrix = ln_eta_via.reshape((n_ok, N_inner))
+
+        # 3. Weakest-link with each sample point holding M / N_inner structures
+        # 3. 最薄弱环节求解，每个采样点代表 M / N_inner 个结构
+        ttf[ok] = self._solve_lifetime_log_vectorized(
+            beta_matrix, ln_eta_matrix, element_weight=1.0 / N_inner
+        )
+        return ttf

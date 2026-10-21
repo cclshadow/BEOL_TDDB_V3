@@ -20,25 +20,50 @@ def load_matrix_csv(csv_path: str) -> np.ndarray:
     return np.loadtxt(csv_path, delimiter=',')
 
 
-def matrix_to_sparse_points(matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
+def valid_die_mask(class_matrix: np.ndarray) -> np.ndarray:
+    """
+    Boolean mask of dies that exist on the wafer, taken from ExistenceClass.
+    根据 ExistenceClass 矩阵得到有效 Die 的布尔掩码。
+
+    A die exists where its class is finite and nonzero. Measurement channels
+    must be masked with this instead of their own values, because a physical
+    measurement can legitimately be 0 (e.g. clipped Space) and dropping it
+    would misalign channels against each other and against the labels.
+    Die 是否存在只由 ExistenceClass 决定；测量值本身可能为 0（例如被截断的 Space），
+    若按各通道自身的 0 值过滤，会导致通道之间以及与标签之间错位。
+    """
+    return np.isfinite(class_matrix) & (class_matrix != 0)
+
+
+def matrix_to_sparse_points(matrix: np.ndarray, valid_mask: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
     """
     Extract valid die values and map them to zero-centered coordinates.
     提取有效的 Die 数据，并将其映射为以晶圆中心为原点的相对坐标。
-    
-    Non-finite values (NaN, Inf) and absolute zeros are ignored.
-    非有限数（NaN, Inf）及绝对 0 值将被视为无效区域并被忽略。
-    
+
+    With `valid_mask` (see `valid_die_mask`), exactly the masked dies are kept,
+    and a non-finite value at a masked die raises an error.
+    Without it, non-finite values (NaN, Inf) and absolute zeros are ignored.
+    传入 `valid_mask` 时严格保留掩码内的 Die（掩码内出现非有限值则报错）；
+    否则非有限数（NaN, Inf）及绝对 0 值将被视为无效区域并被忽略。
+
     Args:
         matrix (np.ndarray): The dense 2D wafer matrix. / 密集的二维晶圆矩阵。
-        
+        valid_mask (np.ndarray, optional): Boolean die mask of the same shape. / 同形状的有效 Die 布尔掩码。
+
     Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray, tuple]: 
+        Tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
             (x_coordinates, y_coordinates, valid_values, original_shape)
             返回稀疏的 (x 坐标集, y 坐标集, 对应的值集合, 原始矩阵形状)。
     """
     rows, cols = matrix.shape
     x_list, y_list, value_list = [], [], []
-    
+
+    if valid_mask is not None:
+        if valid_mask.shape != matrix.shape:
+            raise ValueError(f"valid_mask shape {valid_mask.shape} != matrix shape {matrix.shape}")
+        if not np.isfinite(matrix[valid_mask]).all():
+            raise ValueError("matrix contains non-finite values at valid dies")
+
     # Define the physical center of the wafer / 定义晶圆的物理中心坐标
     center_x = cols // 2
     center_y = rows // 2
@@ -46,10 +71,13 @@ def matrix_to_sparse_points(matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
     for row in range(rows):
         for col in range(cols):
             value = matrix[row, col]
-            
-            # Filter out invalid or zero-value background regions
-            # 过滤掉无效值或数值为 0 的背景区域
-            if not np.isfinite(value) or value == 0:
+
+            # Filter out dies outside the mask, or invalid / zero-value background regions
+            # 过滤掉掩码外的 Die，或无效值、数值为 0 的背景区域
+            if valid_mask is not None:
+                if not valid_mask[row, col]:
+                    continue
+            elif not np.isfinite(value) or value == 0:
                 continue
                 
             # Convert absolute indices to relative coordinates
@@ -105,7 +133,7 @@ def sparse_points_to_matrix(x_arr: np.ndarray, y_arr: np.ndarray,
     return reconstructed_matrix
 
 
-def save_matrix_csv(matrix: np.ndarray, save_path: str = None):
+def save_matrix_csv(matrix: np.ndarray, save_path: str = None, fmt: str = '%.6f'):
     """
     Save the 2D matrix to disk as a CSV format.
     将二维矩阵以 CSV 格式落盘保存。
@@ -116,6 +144,8 @@ def save_matrix_csv(matrix: np.ndarray, save_path: str = None):
     Args:
         matrix (np.ndarray): The 2D matrix to save. / 需要保存的二维矩阵。
         save_path (str, optional): Target file path. Defaults to None. / 目标文件路径，默认为 None。
+        fmt (str, optional): numpy number format. Defaults to 6 decimal places.
+                             numpy 数字格式，默认保留 6 位小数。
     """
     if save_path is None:
         return
@@ -126,6 +156,6 @@ def save_matrix_csv(matrix: np.ndarray, save_path: str = None):
     # 自动创建任意缺失的级联父目录
     path.parent.mkdir(parents=True, exist_ok=True) 
     
-    # Save using 6 decimal places for clean, standardized formatting
-    # 保留 6 位小数以确保格式规范整洁
-    np.savetxt(save_path, matrix, delimiter=',', fmt='%.6f')
+    # Save using 6 decimal places by default for clean, standardized formatting
+    # 默认保留 6 位小数以确保格式规范整洁
+    np.savetxt(save_path, matrix, delimiter=',', fmt=fmt)
